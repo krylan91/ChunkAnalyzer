@@ -15,9 +15,4 @@ public class StringUtils {
         }
         return resultSet;
     }
-
-    public static String toHex(String arg) {
-        return String.format("%040x", new BigInteger(1, arg.getBytes(StandardCharsets.UTF_8)));
-    }
-
 }

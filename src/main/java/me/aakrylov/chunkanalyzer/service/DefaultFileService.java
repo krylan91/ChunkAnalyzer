@@ -17,6 +17,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.file.*;
 import java.util.Comparator;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Stream;
@@ -31,16 +32,23 @@ public class DefaultFileService implements FileService {
 
     private static final int RESERVED_BYTES = 400;
     private static final String INCORRECT_SYMBOL_MESSAGE = "Incorrect symbol [%s] at index [%d]";
+    private static final String FILE_EMPTY = "File [%s] has no content.";
+
     private final Set<Character> number = StringUtils.convertToSet("1234567890");
     private final Set<Character> latin = StringUtils.convertToSet("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ");
     private final Set<Character> special = StringUtils.convertToSet(" !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~\r\n\t");
+    private final String defaultFileLocation;
 
-    @Value("${files.split.default.location}")
-    private String defaultFileLocation;
+    public DefaultFileService(@Value("${files.split.default.location}") String defaultFileLocation) {
+        this.defaultFileLocation = defaultFileLocation;
+    }
 
     @Override
     @Loggable
     public FileOperationResult split(MultipartFile file, int chunkSize) {
+        if (file.isEmpty()) {
+            return emptyFileResult(file.getOriginalFilename());
+        }
         String fileName = file.getOriginalFilename();
         log.info("[{}] Start splitting file.", fileName);
         Integer bufferSize = chunkSize * 1024 - RESERVED_BYTES;
@@ -53,21 +61,22 @@ public class DefaultFileService implements FileService {
         try {
             try (BufferedInputStream bis = new BufferedInputStream(file.getInputStream())) {
                 int bytesAmount;
+                int counter = 1;
                 while ((bytesAmount = bis.read(buffer)) > 0) {
                     String filePartName = String.format("%s.%03d", fileName, partCounter++);
-                    String destinationDir = defaultFileLocation + fileName.replaceAll("\\.", "_");
+                    assert Objects.nonNull(fileName);
+                    String destinationDir = defaultFileLocation + fileName.replace("\\.", "_");
                     createDirIfNotExists(destinationDir);
                     File newFile = new File(destinationDir, filePartName);
                     try (FileOutputStream out = new FileOutputStream(newFile)) {
-                        int counter = 1;
                         log.trace("Splitting file {}, part {}", fileName, counter++);
                         out.write(buffer, 0, bytesAmount);
                     }
                 }
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.error("[{}] Error splitting file into parts: ", fileName, e);
-            return errorResult(e);
+            return errorResult(e.toString());
         }
         return FileOperationResult.builder()
                 .setStatus(FileOperationStatus.SUCCESS)
@@ -79,21 +88,28 @@ public class DefaultFileService implements FileService {
     @Loggable
     public FileOperationResult analyze(MultipartFile file) {
         log.info("[{}] Start file analysis.", file.getOriginalFilename());
+        if (file.isEmpty()) {
+            return emptyFileResult(file.getOriginalFilename());
+        }
         try {
             try (BufferedInputStream bis = new BufferedInputStream(file.getInputStream())) {
                 return isCorrectContent(bis.readAllBytes());
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.error("[{}] Error analyzing file: ", file.getOriginalFilename(), e);
-            return errorResult(e);
+            return errorResult(e.toString());
         }
     }
 
     @Override
     @Loggable
     public FileOperationResult assemble(Path directory, boolean deleteSource) {
-        String fileName = getFileNameFromDirPath(directory);
-        log.info("Build file [{}] from chunks", fileName);
+        if (!Files.isDirectory(directory)) {
+            String errorMessage = String.format("%s is not a directory!", directory);
+            return errorResult(errorMessage);
+        }
+        String fileName = getFileNameFromDir(directory);
+        log.info("Building file [{}] from chunks", fileName);
         try (DirectoryStream<Path> files = Files.newDirectoryStream(directory)) {
             if (dirIsEmpty(directory)) {
                 return FileOperationResult.builder()
@@ -121,9 +137,9 @@ public class DefaultFileService implements FileService {
                             log.error("Error writing file part [{}] to common file:", file.getFileName(), e);
                         }
                     });
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.error("Error building file from path [{}]:", directory, e);
-            return errorResult(e);
+            return errorResult(e.toString());
         }
         return FileOperationResult.builder()
                 .setStatus(FileOperationStatus.SUCCESS)
@@ -145,7 +161,7 @@ public class DefaultFileService implements FileService {
                         try {
                             return Pair.of(filePath, isCorrectContent(Files.readAllBytes(filePath)));
                         } catch (IOException e) {
-                            return Pair.of(filePath, errorResult(e));
+                            return Pair.of(filePath, errorResult(e.toString()));
                         }
                     })
                     .filter(pair -> FileOperationStatus.ERROR.equals(pair.getRight().getStatus()))
@@ -155,9 +171,9 @@ public class DefaultFileService implements FileService {
                     .setStatus(FileOperationStatus.SUCCESS)
                     .setDescription(sb.toString().equals("") ? sb.toString() : null)
                     .build();
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.error("Error analyzing files in [{}]:", directory, e);
-            return errorResult(e);
+            return errorResult(e.toString());
         }
     }
 
@@ -165,19 +181,25 @@ public class DefaultFileService implements FileService {
         if (Files.isDirectory(dir)) {
             try (Stream<Path> entries = Files.list(dir)) {
                 return entries.findFirst().isEmpty();
-            } catch (IOException e) {
+            } catch (Exception e) {
                 return false;
             }
         }
         return false;
     }
 
-    private String getFileNameFromDirPath(Path dirPath) {
-        String dirPathString = dirPath.toString();
-        int indexOfLastUnderscore = dirPathString.lastIndexOf("_");
-        return dirPathString.substring(0, indexOfLastUnderscore) +
-                "." +
-                dirPathString.substring(indexOfLastUnderscore + 1);
+    private String getFileNameFromDir(Path dirPath) {
+        try (DirectoryStream<Path> files = Files.newDirectoryStream(dirPath)) {
+            return StreamSupport.stream(files.spliterator(), false)
+                    .findFirst()
+                    .map(filePath -> {
+                        String fileName = filePath.getFileName().toString();
+                        return fileName.substring(0, fileName.lastIndexOf("."));
+                    })
+                    .orElse("");
+        } catch (Exception e) {
+            return "unknown.txt";
+        }
     }
 
     private void createDirIfNotExists(String dirPath) throws IOException {
@@ -191,7 +213,7 @@ public class DefaultFileService implements FileService {
     private FileOperationResult isCorrectContent(byte[] content) {
         String stringForm = new String(content);
         log.trace("String representation: {}", stringForm);
-        boolean analysisResult = false;
+        boolean analysisResult;
         StringBuilder sb = new StringBuilder();
         for (int indx = 0; indx < stringForm.toCharArray().length; indx++) {
             char symbol = stringForm.toCharArray()[indx];
@@ -219,10 +241,19 @@ public class DefaultFileService implements FileService {
                 (symbol > 31 && symbol < 128);
     }
 
-    private FileOperationResult errorResult(IOException e) {
+    private FileOperationResult errorResult(String description) {
         return FileOperationResult.builder()
                 .setStatus(FileOperationStatus.ERROR)
-                .setDescription(e.toString())
+                .setDescription(description)
+                .build();
+    }
+
+    private FileOperationResult emptyFileResult(String fileName) {
+        String emptyFileMessage = String.format(FILE_EMPTY, fileName);
+        log.error(emptyFileMessage);
+        return FileOperationResult.builder()
+                .setStatus(FileOperationStatus.NO_CONTENT)
+                .setDescription(emptyFileMessage)
                 .build();
     }
 }
